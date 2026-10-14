@@ -1,0 +1,35 @@
+# Local reproduction of the customer's network: the relay can only reach the
+# internet through an authenticated proxy (squid). Run: docker compose up --build -d, then see README
+services:
+  corp-proxy:
+    image: ubuntu/squid:6.6-24.04_beta
+    volumes:
+      - ./squid/squid.conf:/etc/squid/squid.conf:ro
+      - ./squid/passwd:/etc/squid/passwd:ro
+    networks: [internal, internet]
+
+  auth-proxy:
+    build: ..
+    environment:
+      ROUTES: /entra=https://login.microsoftonline.com
+      HTTPS_PROXY: http://corp-proxy:3128
+      NO_PROXY: localhost,127.0.0.1,.svc.cluster.local
+      PROXY_USERNAME: svc-arize
+      PROXY_PASSWORD: Corp-Pa55!
+    # Only on the internal network: no direct route to the internet, just
+    # like the customer's pods.
+    networks: [internal]
+    depends_on: [corp-proxy]
+
+  # Plays the role of Arize: also internal-only, so the relay is its only way out.
+  # Ports cannot be published from an internal network, hence a client container.
+  client:
+    image: curlimages/curl:8.10.1
+    profiles: [test]
+    networks: [internal]
+    entrypoint: ["curl", "-sS", "-w", "\\nHTTP %{http_code}\\n"]
+
+networks:
+  internal:
+    internal: true
+  internet: {}

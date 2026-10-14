@@ -1,0 +1,134 @@
+# auth-proxy: in-cluster egress relay for Arize Custom Model Endpoint OAuth.
+# Deploy into the same namespace as Arize (replace "arize" if yours differs).
+#
+#   kubectl apply -f deploy/kubernetes.yaml
+#   kubectl -n arize get svc auth-proxy -o jsonpath='{.spec.clusterIP}'
+#   -> add "<clusterIP>/32" to allowedIPv4Addresses in Arize values.yaml
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: auth-proxy-upstream-proxy
+  namespace: arize
+type: Opaque
+stringData:
+  # Corporate egress proxy. Credentials are kept separate so they need no URL-escaping.
+  HTTPS_PROXY: "http://proxy.corp.example:8080"
+  PROXY_USERNAME: "CHANGE_ME"
+  PROXY_PASSWORD: "CHANGE_ME"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auth-proxy
+  namespace: arize
+data:
+  # prefix=upstream pairs. Arize calls http://auth-proxy.arize.svc.cluster.local:8080/<prefix>/...
+  # Add more IdPs (Okta, Ping, ...) or a model API here later without code changes.
+  ROUTES: "/entra=https://login.microsoftonline.com"
+  # Only login.microsoftonline.com needs the proxy; anything else the relay is
+  # asked to reach and matches NO_PROXY connects directly.
+  NO_PROXY: "localhost,127.0.0.1,.svc,.svc.cluster.local,.cluster.local"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-proxy
+  namespace: arize
+  labels:
+    app: auth-proxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: auth-proxy
+  template:
+    metadata:
+      labels:
+        app: auth-proxy
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: auth-proxy
+          image: REGISTRY/auth-proxy:0.1.0 # build from ./Dockerfile and push to the internal registry
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: auth-proxy
+            - secretRef:
+                name: auth-proxy-upstream-proxy
+          # If the corporate proxy does TLS inspection, mount its root CA and point Go at it:
+          # env:
+          #   - name: SSL_CERT_FILE
+          #     value: /etc/corp-ca/ca.crt
+          # volumeMounts:
+          #   - name: corp-ca
+          #     mountPath: /etc/corp-ca
+          #     readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      # volumes:
+      #   - name: corp-ca
+      #     configMap:
+      #       name: corp-root-ca
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-proxy
+  namespace: arize
+spec:
+  selector:
+    app: auth-proxy
+  # Optionally pin the ClusterIP (pick a free IP in the Service CIDR) so the
+  # allowedIPv4Addresses entry survives the Service being deleted/recreated.
+  # clusterIP: 10.96.200.10
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+# Only Arize's outbound gateway (externalendpoints) may call the relay.
+# Skip this if your cluster does not enforce NetworkPolicy. Note: if Arize
+# pods are themselves under a default-deny egress policy, also allow egress
+# from app=externalendpoints to app=auth-proxy:8080.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: auth-proxy
+  namespace: arize
+spec:
+  podSelector:
+    matchLabels:
+      app: auth-proxy
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: externalendpoints
+      ports:
+        - port: 8080
