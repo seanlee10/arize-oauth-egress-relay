@@ -2,6 +2,9 @@
 
 This is a sample in-cluster egress relay. With it, Arize on-prem can use OAuth 2.0 on Custom Model Endpoints in a network where outbound traffic must go through a corporate HTTP proxy that requires a username and password. It needs no changes to Arize.
 
+> [!WARNING]
+> **Unofficial sample, not supported.** This is not an Arize product and is not supported by Arize AI. It is a reference implementation provided as-is, without warranty of any kind (see [LICENSE](LICENSE)). Review, test and harden it against your own security and compliance requirements before running it in production. You are responsible for operating it. Arize may add native proxy support later, which would make this relay unnecessary.
+
 ## The problem
 
 Arize sends every outbound call to a customer endpoint through its `externalendpoints` gateway, and that gateway always connects directly to the destination. It ignores `HTTP(S)_PROXY` and has no setting for an upstream proxy. Before calling out, app-server also does a DNS lookup on the Token URL. In a network where the only way out is the proxy, `login.microsoftonline.com` doesn't resolve, so the integration fails with `DNS resolution failed for both IPv4 and IPv6`.
@@ -121,3 +124,7 @@ The tests cover:
 ## Long-term
 
 This is a workaround. The real fix is for `externalendpoints` to support an upstream proxy using `HTTPS_PROXY`/`NO_PROXY` and Basic auth, configured in `values.yaml`. The DNS pre-check would also need to be skipped or relaxed for hosts that go through the proxy. Then this relay can be removed.
+
+## License
+
+[MIT](LICENSE)
