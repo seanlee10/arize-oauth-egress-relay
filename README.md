@@ -1,6 +1,6 @@
 # arize-oauth-egress-relay
 
-This is a sample in-cluster egress relay. With it, Arize on-prem can use OAuth 2.0 on Custom Model Endpoints in a network where outbound traffic must go through a corporate HTTP proxy that requires a username and password. It needs no changes to Arize.
+This is a sample in-cluster egress relay. With it, Arize on-prem can use OAuth 2.0 on Custom Model Endpoints in a network where outbound traffic must go through a corporate HTTP proxy that requires a username and password. It requires no Arize code changes.
 
 > [!WARNING]
 > **Unofficial sample, not supported.** This is not an Arize product and is not supported by Arize AI. It is a reference implementation provided as-is, without warranty of any kind (see [LICENSE](LICENSE)). Review, test and harden it against your own security and compliance requirements before running it in production. You are responsible for operating it. Arize may add native proxy support later, which would make this relay unnecessary.
@@ -11,12 +11,32 @@ Arize sends every outbound call to a customer endpoint through its `externalendp
 
 ## How the relay works
 
+```mermaid
+flowchart LR
+    subgraph cluster["Kubernetes cluster"]
+        arize["Arize (generative / app-server)"]
+        gateway["externalendpoints gateway"]
+        relay["auth-proxy Service and Deployment"]
+
+        arize -->|"OAuth token request to the relay's cluster FQDN"| gateway
+        gateway -->|"Direct HTTP on port 8080"| relay
+    end
+
+    proxy["Corporate HTTP proxy"]
+    entra["Microsoft Entra ID (login.microsoftonline.com)"]
+
+    relay -->|"HTTPS_PROXY: CONNECT with Proxy-Authorization: Basic"| proxy
+    proxy -->|"TLS tunnel to the upstream on port 443"| entra
+
+    classDef arizeNode fill:#eff6ff,stroke:#2563eb,color:#172554
+    classDef relayNode fill:#ecfdf5,stroke:#059669,color:#064e3b
+    classDef externalNode fill:#fff7ed,stroke:#ea580c,color:#7c2d12
+    class arize,gateway arizeNode
+    class relay relayNode
+    class proxy,entra externalNode
 ```
- Arize (generative / app-server)
-   │  Token URL = http://auth-proxy.arize.svc.cluster.local:8080/entra/<tenant>/oauth2/v2.0/token
-   ▼
- externalendpoints ──(direct, in-cluster)──▶ auth-proxy ──CONNECT + Proxy-Authorization: Basic──▶ corporate proxy ──TLS──▶ login.microsoftonline.com
-```
+
+The relay strips `/entra` and sends the OAuth request over TLS through the CONNECT tunnel. Responses return along the same path.
 
 - Arize is configured with the relay's **in-cluster** URL. That name resolves through cluster DNS and the relay is reachable directly, so both the DNS pre-check and `externalendpoints` work unchanged.
 - The relay removes the route prefix and forwards the request as-is to the real upstream over HTTPS. The method, body, `Authorization: Basic <client_id:secret>` header and the response all pass through unchanged. Redirects are passed through, not followed.
@@ -33,6 +53,8 @@ It is built around three requirements:
 
 ## Configuration
 
+The administrator configures these environment variables on the relay.
+
 | Env | Example | Notes |
 |---|---|---|
 | `ROUTES` | `/entra=https://login.microsoftonline.com` | Comma-separated `prefix=upstream` pairs. Longest prefix wins. |
@@ -43,13 +65,21 @@ It is built around three requirements:
 | `LISTEN_ADDR` | `:8080` | |
 | `SSL_CERT_FILE` | `/etc/corp-ca/ca.crt` | Only needed if the corporate proxy does TLS inspection: the CA bundle to trust. |
 
-## Deploy (on-prem)
+## Setup (on-prem)
+
+An administrator deploys the relay and configures Arize to allow requests to it. After that setup, the Arize integration user changes the **Token URL** in their Custom Model Endpoint and tests the integration. The URL points to the relay, which forwards requests through the corporate proxy.
+
+### Administrator setup
+
+You need access to the Kubernetes cluster, an internal image registry, the corporate proxy URL and credentials, and the Arize deployment's `values.yaml`. The commands below use the `arize` namespace. Substitute your namespace if it differs.
+
+`http://` and port `8080` are accepted on-prem, since the HTTPS and port-443 rules apply only to SaaS. The hop from Arize to the relay is cluster-internal. The client secret goes to the relay in plaintext over the pod network, and from the relay to Entra over TLS. If that internal hop must be encrypted, put the relay behind your service mesh (mTLS) or terminate TLS on the relay.
 
 1. **Build and push the image** to the internal registry:
    ```sh
    docker build -t REGISTRY/auth-proxy:0.1.0 . && docker push REGISTRY/auth-proxy:0.1.0
    ```
-2. **Edit and apply** [`deploy/kubernetes.yaml`](deploy/kubernetes.yaml). Set the proxy URL and credentials in the Secret and the image name. Change the namespace if Arize is not in `arize`.
+2. **Edit and apply** [`deploy/kubernetes.yaml`](deploy/kubernetes.yaml). Set the proxy URL and credentials in the Secret and the image name in the Deployment. Change the namespace throughout the manifest if Arize is not in `arize`. If the proxy inspects TLS, configure the corporate CA mount and `SSL_CERT_FILE` using the commented example in the manifest.
    ```sh
    kubectl apply -f deploy/kubernetes.yaml
    kubectl -n arize get svc auth-proxy -o jsonpath='{.spec.clusterIP}'
@@ -60,14 +90,28 @@ It is built around three requirements:
    # allowedIPv6Addresses: "<ipv6 clusterIP>/128"   # dual-stack clusters only
    ```
    To keep the IP stable if the Service is ever recreated, pin `spec.clusterIP` in the Service (there is a comment showing where).
-4. **Configure the Custom Model Endpoint in Arize** (OAuth 2.0):
-   - **Token URL:** `http://auth-proxy.arize.svc.cluster.local:8080/entra/<tenant-id>/oauth2/v2.0/token`
-     Use the **fully-qualified** name. Arize resolves it with `dns.resolve4`, which does not apply the resolv.conf search domains.
-   - **Client ID / Secret / Scope:** unchanged, for example `api://<app-id>/.default`.
-   - **API Base URL:** unchanged if the model endpoint is reachable directly. If it also sits behind the proxy, add a route such as `/llm=https://llm.example.com` and use `http://auth-proxy.arize.svc.cluster.local:8080/llm/v1`. Responses are streamed without buffering.
-5. Click **Test Integration**. It runs the same token flow through the relay.
+4. **Check the deployment and network access.** Wait for the relay to become ready (replace `arize` if you changed the namespace):
+   ```sh
+   kubectl -n arize rollout status deployment/auth-proxy
+   ```
+   Ensure that cluster network policies allow `externalendpoints` to reach `auth-proxy:8080` and the relay to reach the corporate proxy. The supplied NetworkPolicy allows ingress only from pods labelled `app: externalendpoints`.
+5. **Give the integration user the relay Token URL** shown below, adjusted for your namespace, route prefix, and tenant. Use the **fully-qualified** hostname. Arize resolves it with `dns.resolve4`, which does not apply the resolv.conf search domains.
 
-`http://` and port `8080` are accepted on-prem, since the https and port-443 rules apply only to SaaS. The hop from Arize to the relay is cluster-internal. The client secret goes to the relay in plaintext over the pod network, and from the relay to Entra over TLS. If that internal hop must be encrypted, put the relay behind your service mesh (mTLS) or terminate TLS on the relay.
+If the model API also needs the corporate proxy, include a route such as `/llm=https://llm.example.com` in `ROUTES` when editing the ConfigMap in step 2. Also give the integration user the relayed **API Base URL**, for example `http://auth-proxy.arize.svc.cluster.local:8080/llm/v1`. Responses are streamed without buffering.
+
+### Arize integration user setup
+
+Complete these steps after the administrator has finished setup and provided the relay URL. You do not need Kubernetes access or the corporate proxy credentials.
+
+1. Open your **Custom Model Endpoint** in Arize with **OAuth 2.0** authentication.
+2. Set **Token URL** to the full URL provided by your administrator. For the default namespace and Entra route, it has this form:
+   ```text
+   http://auth-proxy.arize.svc.cluster.local:8080/entra/<tenant-id>/oauth2/v2.0/token
+   ```
+   Replace `<tenant-id>` with your Entra tenant ID. The URL must include the scheme, fully-qualified relay hostname, port, route prefix, and token endpoint path.
+3. Keep your existing **Client ID**, **Client Secret**, and **Scope**, for example `api://<app-id>/.default`. These are your OAuth credentials. The administrator configures the separate corporate proxy credentials on the relay.
+4. Keep **API Base URL** unchanged if the model endpoint is reachable directly. If your administrator also configured a model API route, use the relayed API Base URL they provide.
+5. Click **Test Integration** to verify the token flow through the relay. If it fails, use the [troubleshooting table](#troubleshooting) with your administrator.
 
 ## Local demo: a real proxy with Basic auth and real Entra
 
